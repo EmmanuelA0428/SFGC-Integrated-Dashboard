@@ -1,0 +1,3 @@
+dataset,goal,folder,display_name,source_type,source_name,source_url,contact_name,contact_email,how_to_collect,last_updated,archived,fetcher,row_count,year_min,year_max
+Income.csv,3,goal3,Synthetic income (goal3),public,Fabricated demonstration data — not Geneva statistics,,,,Synthetic values for software demonstrations only.,2026-01-01,,,2,2024,2025
+Income.csv,background,background,Synthetic income (background),public,Fabricated demonstration data — not Geneva statistics,,,,Synthetic values for software demonstrations only.,2026-01-01,,,2,2024,2025

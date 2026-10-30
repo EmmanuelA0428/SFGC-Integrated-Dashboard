@@ -1,0 +1,470 @@
+---
+title: "Success for Geneva's Children — Internal Goal Report"
+subtitle: "`r if (exists('GOAL_LABELS') && !is.null(GOAL_LABELS[as.character(params$goal)][[1]])) GOAL_LABELS[as.character(params$goal)][[1]] else paste('Goal', params$goal)`"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 2
+  word_document:
+    toc: true
+params:
+  goal:     "1"
+  yr_start: NULL
+  yr_end:   NULL
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  results = "asis",
+  warning = FALSE,
+  message = FALSE,
+  comment = "",
+  fig.width  = 7,
+  fig.height = 3.8,
+  dpi = 150
+)
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(here)
+  library(knitr)
+})
+
+source(here("internal", "modules", "helpers.R"))
+
+meta       <- active_meta(load_meta())
+goal_rows  <- meta[as.character(meta$goal) == as.character(params$goal), , drop = FALSE]
+
+# Columns that are usually grouping / categorical
+GROUP_COL_CANDIDATES <- c(
+  "Community", "Location", "Geography", "ZIP", "District",
+  "School District", "County", "Region", "Group", "Category",
+  "Cohort", "Grade", "Age", "Age Group", "Race", "Ethnicity",
+  "Race/Ethnicity", "Type", "Classification", "Subject", "Status"
+)
+
+# -- helpers ---------------------------------------------------------------
+
+as_numeric_safe <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(gsub("[,$%]", "", as.character(x))))
+}
+
+# Parse Year strings liberally: "2019" -> 2019, "2014-2015" -> 2014,
+# "20-02" (YY-MM) -> NA (so we fall back to factor on the raw string).
+parse_year <- function(x) {
+  if (is.null(x)) return(integer(0))
+  s <- as.character(x)
+  m <- regmatches(s, regexpr("(?<!\\d)(19|20)\\d{2}", s, perl = TRUE))
+  out <- rep(NA_integer_, length(s))
+  ok  <- regexpr("(?<!\\d)(19|20)\\d{2}", s, perl = TRUE) > 0
+  out[ok] <- as.integer(m)
+  out
+}
+
+year_is_numeric_like <- function(x) {
+  yy <- parse_year(x)
+  sum(!is.na(yy)) >= max(2L, ceiling(0.6 * length(x)))
+}
+
+filter_years <- function(df) {
+  if (is.null(df) || !"Year" %in% names(df)) return(df)
+  yn <- parse_year(df$Year)
+  if (!all(is.na(yn))) {
+    if (!is.null(params$yr_start)) {
+      df <- df[is.na(yn) | yn >= as.integer(params$yr_start), , drop = FALSE]
+      yn <- parse_year(df$Year)
+    }
+    if (!is.null(params$yr_end)) {
+      df <- df[is.na(yn) | yn <= as.integer(params$yr_end), , drop = FALSE]
+    }
+  }
+  df
+}
+
+# Classify each column: is it numeric-like, categorical, or the Year column?
+detect_columns <- function(df) {
+  cols <- names(df)
+  # Columns we never want to plot or use as grouping.
+  ignore_c <- intersect(cols, c("Source", "Notes", "Note", "Comment",
+                                "Comments", "Month", "Day"))
+
+  # Numeric columns: values mostly parseable as numbers.
+  numeric_c <- cols[vapply(df, function(x) {
+    if (is.numeric(x)) return(TRUE)
+    v <- as_numeric_safe(x)
+    sum(!is.na(v)) >= max(2L, ceiling(0.6 * length(v)))
+  }, logical(1))]
+  numeric_c <- setdiff(numeric_c, c("Year", ignore_c))
+
+  # Grouping columns: anything left that's not numeric, not Year, not ignored.
+  group_c <- setdiff(cols, c(numeric_c, "Year", ignore_c))
+
+  # Is Year a real year series (e.g. 2010, 2011, ...) or categorical
+  # (e.g. "2014-2015", "20-02", "2009-11")?
+  year_num <- "Year" %in% cols && year_is_numeric_like(df$Year)
+
+  list(
+    numeric    = numeric_c,
+    group      = group_c,
+    has_year   = "Year" %in% cols,
+    year_num   = year_num
+  )
+}
+
+coerce_numeric_cols <- function(df, cols) {
+  for (cc in cols) df[[cc]] <- as_numeric_safe(df[[cc]])
+  df
+}
+
+# Drop columns/factor-levels with all-NA values so charts stay readable.
+drop_empty_levels <- function(df, col) {
+  df[[col]] <- factor(df[[col]], levels = unique(stats::na.omit(df[[col]])))
+  df
+}
+
+# Build the chart best suited to the data. Returns NULL if nothing useful
+# can be drawn, so we skip silently.
+build_chart <- function(df, title) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  info <- detect_columns(df)
+  if (length(info$numeric) == 0) return(NULL)
+
+  df <- coerce_numeric_cols(df, info$numeric)
+  val  <- info$numeric[[1]]
+  grps <- info$group
+  has_year <- info$has_year
+  year_num <- info$year_num
+
+  # Helper: the x-axis column + whether it should be treated as continuous.
+  x_col     <- if (has_year) "Year" else if (length(grps) >= 1) grps[[1]] else NULL
+  x_is_time <- has_year && year_num
+  # Pick remaining grouping columns (those not used as x).
+  other_grps <- if (has_year) grps else setdiff(grps, x_col)
+
+  # ── Case 1: x = Year + two grouping columns (facet by one, fill by other) ──
+  if (!is.null(x_col) && length(other_grps) >= 2) {
+    facet_by <- other_grps[[1]]
+    fill_by  <- other_grps[[2]]
+    d <- df[!is.na(df[[val]]), , drop = FALSE]
+    if (nrow(d) >= 2) {
+      xmap <- if (x_is_time) aes(x = parse_year(.data[[x_col]])) else aes(x = factor(.data[[x_col]]))
+      p <- ggplot(d, aes(y = .data[[val]], fill = .data[[fill_by]])) +
+        xmap +
+        geom_col(position = position_stack()) +
+        facet_wrap(as.formula(paste0("~`", facet_by, "`")), scales = "free_y") +
+        labs(title = title,
+             x = if (x_is_time) "Year" else x_col,
+             y = val, fill = fill_by)
+      return(style_plot(p))
+    }
+  }
+
+  # ── Case 2: x = Year (numeric) + one grouping col ──
+  # If the grouping looks like a location comparison (Community / District /
+  # County / Geography / Location / ZIP / Region), draw a multi-series line,
+  # matching the reference report's Community-comparison charts.
+  # Otherwise (Age, Race, Classification, Cohort, Type, Category, etc.)
+  # draw a stacked bar so the parts-of-whole story comes through.
+  LOCATION_GRPS <- c("Community", "Location", "Geography", "ZIP", "District",
+                     "School District", "County", "Region")
+  if (!is.null(x_col) && has_year && year_num && length(other_grps) == 1) {
+    grp <- other_grps[[1]]
+    d   <- df[!is.na(df[[val]]), , drop = FALSE]
+    d$._yr <- parse_year(d[[x_col]])
+    d   <- d[!is.na(d$._yr), , drop = FALSE]
+    n_grp <- length(unique(d[[grp]]))
+    is_location <- grp %in% LOCATION_GRPS
+
+    if (nrow(d) >= 2 && is_location && n_grp <= 12) {
+      # Multi-series comparison over time.
+      p <- ggplot(d, aes(x = ._yr, y = .data[[val]],
+                         colour = .data[[grp]], group = .data[[grp]])) +
+        geom_line(linewidth = 0.9) +
+        geom_point(size = 2) +
+        labs(title = title, x = "Year", y = val, colour = grp)
+      return(style_plot(p))
+    } else if (nrow(d) >= 2 && n_grp <= 12) {
+      # Parts of a whole (or ordered categories) → stacked bar by year.
+      p <- ggplot(d, aes(x = factor(._yr), y = .data[[val]],
+                         fill = .data[[grp]])) +
+        geom_col(position = position_stack(), width = 0.8) +
+        labs(title = title, x = "Year", y = val, fill = grp) +
+        theme(axis.text.x = element_text(angle = 30, hjust = 1))
+      return(style_plot(p))
+    } else if (nrow(d) >= 2) {
+      # Fallback if grouping has too many levels to be useful.
+      p <- ggplot(d, aes(x = ._yr, y = .data[[val]], group = .data[[grp]])) +
+        geom_line(linewidth = 0.6, colour = "#2C6E49", alpha = 0.6) +
+        labs(title = title, x = "Year", y = val)
+      return(style_plot(p))
+    }
+  }
+
+  # ── Case 3: x = Year (categorical/period) + one grouping col → grouped bar ──
+  if (!is.null(x_col) && has_year && !year_num && length(other_grps) == 1) {
+    grp <- other_grps[[1]]
+    d   <- df[!is.na(df[[val]]), , drop = FALSE]
+    if (nrow(d) >= 2) {
+      d[[x_col]] <- factor(d[[x_col]], levels = unique(d[[x_col]]))
+      p <- ggplot(d, aes(x = .data[[x_col]], y = .data[[val]],
+                         fill = .data[[grp]])) +
+        geom_col(position = position_dodge(preserve = "single"), width = 0.8) +
+        labs(title = title, x = x_col, y = val, fill = grp) +
+        theme(axis.text.x = element_text(angle = 30, hjust = 1))
+      return(style_plot(p))
+    }
+  }
+
+  # ── Case 4: x = Year (numeric) alone → bar by year ──
+  if (!is.null(x_col) && has_year && year_num && length(other_grps) == 0) {
+    d <- df[!is.na(df[[val]]), , drop = FALSE]
+    d$._yr <- parse_year(d[[x_col]])
+    d <- d[!is.na(d$._yr), , drop = FALSE]
+    if (nrow(d) >= 2) {
+      p <- ggplot(d, aes(x = factor(._yr), y = .data[[val]])) +
+        geom_col(fill = "#2C6E49", width = 0.7) +
+        labs(title = title, x = "Year", y = val)
+      return(style_plot(p))
+    }
+  }
+
+  # ── Case 5: x = Year (categorical) alone → bar by period ──
+  if (!is.null(x_col) && has_year && !year_num && length(other_grps) == 0) {
+    d <- df[!is.na(df[[val]]), , drop = FALSE]
+    if (nrow(d) >= 2) {
+      d[[x_col]] <- factor(d[[x_col]], levels = unique(d[[x_col]]))
+      p <- ggplot(d, aes(x = .data[[x_col]], y = .data[[val]])) +
+        geom_col(fill = "#2C6E49", width = 0.7) +
+        labs(title = title, x = x_col, y = val) +
+        theme(axis.text.x = element_text(angle = 30, hjust = 1))
+      return(style_plot(p))
+    }
+  }
+
+  # ── Case 6: no Year, one categorical + numeric → horizontal ranked bar ──
+  if (!has_year && length(grps) >= 1) {
+    grp <- grps[[1]]
+    d <- df[!is.na(df[[val]]) & !is.na(df[[grp]]), , drop = FALSE]
+    if (nrow(d) >= 2) {
+      p <- ggplot(d, aes(x = reorder(.data[[grp]], .data[[val]]),
+                         y = .data[[val]])) +
+        geom_col(fill = "#2C6E49", alpha = 0.9) +
+        coord_flip() +
+        labs(title = title, x = grp, y = val)
+      return(style_plot(p))
+    }
+  }
+
+  # ── Case 7: no Year, multiple numerics → pivot long, bar ──
+  if (!has_year && length(info$numeric) >= 2) {
+    d <- df
+    d$._idx <- seq_len(nrow(d))
+    long <- pivot_longer(d, cols = all_of(info$numeric),
+                         names_to = "Series", values_to = "Value")
+    p <- ggplot(long, aes(x = factor(._idx), y = Value, fill = Series)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+      labs(title = title, x = NULL, y = NULL, fill = NULL)
+    return(style_plot(p))
+  }
+
+  NULL
+}
+
+style_plot <- function(p) {
+  p +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(size = 11, face = "bold"),
+      plot.background  = element_rect(fill = "white", colour = NA)
+    ) +
+    scale_colour_brewer(palette = "Set2", na.value = "grey50") +
+    scale_fill_brewer(palette = "Set2", na.value = "grey50")
+}
+
+# Human-readable bullets summarising a dataset: period, latest value, direction.
+summarise_dataset <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(character())
+  out <- character()
+  info <- detect_columns(df)
+
+  if (info$has_year) {
+    yy <- parse_year(df$Year)
+    yy <- yy[!is.na(yy)]
+    if (length(yy) > 0) {
+      out <- c(out, sprintf("- **Period covered:** %d–%d (%d data point%s).",
+                            min(yy), max(yy), length(unique(yy)),
+                            if (length(unique(yy)) == 1) "" else "s"))
+    } else {
+      periods <- unique(as.character(df$Year))
+      periods <- periods[!is.na(periods) & nzchar(periods)]
+      if (length(periods) > 0) {
+        out <- c(out, sprintf("- **Periods covered:** %s (%d).",
+                              paste(utils::head(periods, 6), collapse = ", "),
+                              length(periods)))
+      }
+    }
+  } else {
+    out <- c(out, sprintf("- **Rows in view:** %d.", nrow(df)))
+  }
+
+  if (length(info$numeric) >= 1 && info$has_year && info$year_num) {
+    val <- info$numeric[[1]]
+    yy  <- parse_year(df$Year)
+    v   <- as_numeric_safe(df[[val]])
+    ord <- order(yy)
+    yy2 <- yy[ord]; v2 <- v[ord]
+    keep <- !is.na(yy2) & !is.na(v2)
+    yy2 <- yy2[keep]; v2 <- v2[keep]
+    if (length(v2) >= 2) {
+      latest_y <- tail(yy2, 1); latest_v <- tail(v2, 1)
+      first_y  <- head(yy2, 1); first_v  <- head(v2, 1)
+      delta <- latest_v - first_v
+      dir_word <- if (abs(delta) < 1e-9) "flat" else if (delta > 0) "up" else "down"
+      out <- c(out, sprintf(
+        "- **Most recent value (%s, %d):** %s. Trend since %d: %s.",
+        val, latest_y, format(latest_v, big.mark = ",", trim = TRUE),
+        first_y, dir_word
+      ))
+    }
+  }
+  out
+}
+
+md_escape <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  gsub("([*_`])", "\\\\\\1", x)
+}
+
+source_markdown <- function(r) {
+  name <- as.character(r$source_name %||% "")
+  url  <- as.character(r$source_url  %||% "")
+  if (nzchar(url) && nzchar(name)) return(sprintf("[%s](%s)", name, url))
+  if (nzchar(url)) return(sprintf("[%s](%s)", url, url))
+  if (nzchar(name)) return(name)
+  "_Source not recorded._"
+}
+```
+
+```{r intro}
+cat(sprintf("# About This Report\n\n"))
+goal_label <- {
+  g <- as.character(params$goal)
+  lab <- if (exists("GOAL_LABELS") && g %in% names(GOAL_LABELS)) GOAL_LABELS[[g]] else NULL
+  if (is.null(lab) || !nzchar(lab)) paste("Goal", g) else lab
+}
+cat(sprintf(
+  "This internal report summarises data currently available for **%s**.\n\n",
+  md_escape(goal_label)
+))
+if (!is.null(params$yr_start) && !is.null(params$yr_end)) {
+  cat(sprintf("_Data shown for %s–%s._\n\n", params$yr_start, params$yr_end))
+} else {
+  cat("_All available years are shown._\n\n")
+}
+cat("\\newpage\n\n")
+```
+
+```{r goal-summary}
+cat("# Goal Summary\n\n")
+
+n_total     <- nrow(goal_rows)
+loaded_list <- lapply(seq_len(n_total), function(i) load_dataset(goal_rows[i, , drop = FALSE]))
+n_with_data <- sum(vapply(loaded_list, function(x) !is.null(x), logical(1)))
+
+last_updated <- {
+  lu <- goal_rows$last_updated
+  lu <- lu[!is.na(lu) & nzchar(trimws(lu))]
+  if (length(lu) == 0) "Never" else max(lu)
+}
+
+summary_df <- data.frame(
+  Metric = c("Datasets tracked", "Datasets with data", "Most recently updated"),
+  Value  = c(n_total, n_with_data, last_updated),
+  stringsAsFactors = FALSE
+)
+print(kable(summary_df, col.names = c("Metric", "Value")))
+cat("\n")
+
+if (n_total == 0) {
+  cat("_No datasets are currently registered under this goal._\n\n")
+} else {
+  cat("**Datasets included in this report:**\n\n")
+  for (i in seq_len(n_total)) {
+    r <- goal_rows[i, , drop = FALSE]
+    cat(sprintf("- %s\n", md_escape(r$display_name %||% r$dataset)))
+  }
+  cat("\n")
+}
+cat("\\newpage\n\n")
+```
+
+```{r per-dataset}
+if (nrow(goal_rows) == 0) {
+  cat("# Data by Dataset\n\n_No datasets available._\n")
+} else {
+  cat("# Data by Dataset\n\n")
+  for (i in seq_len(nrow(goal_rows))) {
+    r  <- goal_rows[i, , drop = FALSE]
+    df <- loaded_list[[i]]
+
+    cat(sprintf("## %s\n\n", md_escape(r$display_name %||% r$dataset)))
+
+    if (is.null(df) || nrow(df) == 0) {
+      cat("_No data file found for this dataset yet._\n\n")
+      next
+    }
+
+    df <- filter_years(df)
+    if (nrow(df) == 0) {
+      cat("_No data in the selected year range._\n\n")
+      next
+    }
+
+    bullets <- summarise_dataset(df)
+    if (length(bullets) > 0) {
+      cat(paste(bullets, collapse = "\n"), "\n\n", sep = "")
+    }
+    cat(sprintf("- **Source:** %s\n\n", source_markdown(r)))
+
+    p <- tryCatch(build_chart(df, r$display_name %||% r$dataset),
+                  error = function(e) NULL)
+    if (!is.null(p)) {
+      print(p)
+      cat("\n\n")
+    } else {
+      # Only show a small table if the chart can't be rendered — keep it tight.
+      snap <- utils::head(df, 8)
+      print(kable(snap, caption = sprintf("%s — first rows",
+                                          r$display_name %||% r$dataset)))
+      cat("\n")
+    }
+    cat("\\newpage\n\n")
+  }
+}
+```
+
+```{r sources}
+cat("# Sources\n\n")
+if (nrow(goal_rows) == 0) {
+  cat("_No sources to list._\n")
+} else {
+  for (i in seq_len(nrow(goal_rows))) {
+    r <- goal_rows[i, , drop = FALSE]
+    cat(sprintf("- **%s:** %s\n",
+                md_escape(r$display_name %||% r$dataset),
+                source_markdown(r)))
+  }
+  cat("\n")
+}
+cat("\n---\n\n")
+cat("_Report generated by the Success for Geneva's Children internal dashboard._\n")
+```

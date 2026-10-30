@@ -1,0 +1,38 @@
+# R
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user
+
+# renv
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
+
+.Renviron
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+*.tmp
+*.bak
+
+# Never publish local secrets or operational/client records.
+.env
+.env.*
+!.env.example
+.Renviron.*
+*.pem
+*.key
+/data/
+/rsconnect/
+.Rproj.user/
+__MACOSX/
+*.bak.*
